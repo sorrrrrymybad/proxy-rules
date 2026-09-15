@@ -44,6 +44,11 @@ api_call() {
         -H "Accept: application/json")
 
     request_url="${API_BASE}"
+    request_url="${request_url#\[}"
+    request_url="${request_url%%\]*}"
+    if [[ "${request_url}" == */panel/api ]]; then
+        request_url="${request_url%/panel/api}"
+    fi
     while [[ "${request_url}" == */ ]]; do
         request_url="${request_url%/}"
     done
