@@ -104,6 +104,7 @@ discover_panel_api_base() {
     fi
 
     access_url="$(printf '%s\n' "${settings_output}" \
+        | sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g' \
         | sed -n -E 's/.*Access URL:[[:space:]]*//p' \
         | sed -E 's/^\[//; s/\].*$//; s/[[:space:]]+$//' \
         | tail -n 1)"
@@ -147,6 +148,63 @@ random_hex() {
     fi
 
     od -An -N "${byte_count}" -tx1 /dev/urandom | tr -d '[:space:]'
+}
+
+random_string() {
+    local length="$1"
+    local alphabet="$2"
+    local result='' index random_byte
+
+    while (( ${#result} < length )); do
+        random_byte="$(od -An -N1 -tu1 /dev/urandom)"
+        index=$((random_byte % ${#alphabet}))
+        result+="${alphabet:index:1}"
+    done
+    printf '%s\n' "${result}"
+}
+
+random_lower_num() {
+    random_string "$1" '0123456789abcdefghijklmnopqrstuvwxyz'
+}
+
+random_uuid() {
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        tr -d '\n' < /proc/sys/kernel/random/uuid
+        printf '\n'
+        return 0
+    fi
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+        return 0
+    fi
+
+    local hex
+    hex="$(random_hex 16)"
+    hex="${hex:0:12}4${hex:13}"
+    hex="${hex:0:16}8${hex:17}"
+    printf '%s-%s-%s-%s-%s\n' \
+        "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+}
+
+random_short_ids() {
+    local -a lengths=(2 4 6 8 10 12 14 16)
+    local i j tmp length short_id short_ids='[]'
+
+    # Match the panel's generator: eight IDs with distinct even lengths from
+    # 2 through 16 hexadecimal characters, in a random order.
+    for ((i=${#lengths[@]}-1; i>0; i--)); do
+        j=$((RANDOM % (i + 1)))
+        tmp="${lengths[i]}"
+        lengths[i]="${lengths[j]}"
+        lengths[j]="${tmp}"
+    done
+
+    for length in "${lengths[@]}"; do
+        short_id="$(random_hex $((length / 2)))"
+        short_ids="$(jq -c --arg short_id "${short_id}" '. + [$short_id]' <<<"${short_ids}")"
+    done
+
+    printf '%s\n' "${short_ids}"
 }
 
 get_existing_inbound_id() {
@@ -333,7 +391,8 @@ configure_xui_api() {
 
     local api_token domain node_name client_name total_gb
     local current_day expiry_time total_bytes
-    local reality_response reality_private_key short_ids short_id
+    local reality_response reality_private_key reality_public_key short_ids
+    local spider_x client_uuid client_password client_sub_id client_auth
     local inbounds_response helper_id vless_id hy2_id
     local helper_clients vless_clients hy2_clients
     local helper_remark vless_remark hy2_remark
@@ -395,6 +454,11 @@ configure_xui_api() {
     current_day="$(date +%d | sed 's/^0*//')"
     total_bytes=$((total_gb * 1073741824))
     expiry_time="$(( $(date +%s) + 30 * 86400 ))000"
+    spider_x="/$(random_string 15 '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+    client_uuid="$(random_uuid)"
+    client_password="$(random_lower_num 16)"
+    client_sub_id="$(random_lower_num 16)"
+    client_auth="$(random_lower_num 16)"
 
     echo "正在生成 Reality 密钥..."
     reality_response="$(api_call GET "/panel/api/server/getNewX25519Cert")" || {
@@ -407,17 +471,14 @@ configure_xui_api() {
     }
 
     reality_private_key="$(jq -r '.obj.privateKey // empty' <<<"${reality_response}")"
-    if [[ -z "${reality_private_key}" ]]; then
-        echo "错误：API 未返回 Reality privateKey。"
+    reality_public_key="$(jq -r '.obj.publicKey // empty' <<<"${reality_response}")"
+    if [[ -z "${reality_private_key}" || -z "${reality_public_key}" ]]; then
+        echo "错误：API 未返回完整的 Reality 公钥/私钥。"
         API_TOKEN=""
         return 1
     fi
 
-    short_ids='[]'
-    for _ in 1 2 3 4 5 6 7 8; do
-        short_id="$(random_hex 8)"
-        short_ids="$(jq -c --arg short_id "${short_id}" '. + [$short_id]' <<<"${short_ids}")"
-    done
+    short_ids="$(random_short_ids)"
 
     inbounds_response="$(api_call GET "/panel/api/inbounds/list")" || {
         API_TOKEN=""
@@ -445,9 +506,9 @@ configure_xui_api() {
         return 1
     }
 
-    helper_remark="in-8443-tcp ${node_name}"
-    vless_remark="in-443-tcp ${node_name} - A"
-    hy2_remark="in-443-udp ${node_name} - B"
+    helper_remark="${node_name}"
+    vless_remark="${node_name} - A"
+    hy2_remark="${node_name} - B"
 
     helper_payload="$(jq -n \
         --arg remark "${helper_remark}" \
@@ -474,10 +535,7 @@ configure_xui_api() {
                 }
             },
             sniffing: {
-                enabled: true,
-                destOverride: ["http", "tls", "quic"],
-                metadataOnly: false,
-                routeOnly: false
+                enabled: false
             }
         }')"
 
@@ -485,6 +543,8 @@ configure_xui_api() {
         --arg remark "${vless_remark}" \
         --arg domain "${domain}" \
         --arg private_key "${reality_private_key}" \
+        --arg public_key "${reality_public_key}" \
+        --arg spider_x "${spider_x}" \
         --argjson short_ids "${short_ids}" \
         --argjson clients "${vless_clients}" \
         ' {
@@ -498,7 +558,8 @@ configure_xui_api() {
             settings: {
                 clients: $clients,
                 decryption: "none",
-                fallbacks: [{ dest: 8443, xver: 0 }]
+                encryption: "none",
+                fallbacks: [{ alpn: "", dest: 8443, name: "", path: "", xver: 0 }]
             },
             streamSettings: {
                 network: "tcp",
@@ -506,10 +567,20 @@ configure_xui_api() {
                 realitySettings: {
                     show: false,
                     xver: 0,
-                    dest: "127.0.0.1:8443",
+                    target: "127.0.0.1:8443",
                     serverNames: [$domain],
                     privateKey: $private_key,
-                    shortIds: $short_ids
+                    minClientVer: "",
+                    maxClientVer: "",
+                    maxTimediff: 0,
+                    shortIds: $short_ids,
+                    settings: {
+                        publicKey: $public_key,
+                        fingerprint: "chrome",
+                        serverName: "",
+                        spiderX: $spider_x,
+                        mldsa65Verify: ""
+                    }
                 },
                 tcpSettings: {
                     acceptProxyProtocol: false,
@@ -517,10 +588,7 @@ configure_xui_api() {
                 }
             },
             sniffing: {
-                enabled: true,
-                destOverride: ["http", "tls", "quic"],
-                metadataOnly: false,
-                routeOnly: false
+                enabled: false
             }
         }')"
 
@@ -549,23 +617,48 @@ configure_xui_api() {
                 security: "tls",
                 hysteriaSettings: {
                     version: 2,
-                    masquerade: "",
-                    udpIdleTimeout: 60
+                    udpIdleTimeout: 60,
+                    masquerade: {
+                        type: "",
+                        dir: "",
+                        url: "",
+                        rewriteHost: false,
+                        insecure: false,
+                        content: "",
+                        headers: {},
+                        statusCode: 0
+                    }
                 },
                 tlsSettings: {
                     serverName: $domain,
+                    minVersion: "1.2",
+                    maxVersion: "1.3",
+                    cipherSuites: "",
+                    rejectUnknownSni: false,
+                    disableSystemRoot: false,
+                    enableSessionResumption: false,
                     alpn: ["h3"],
                     certificates: [{
+                        ocspStapling: 0,
+                        oneTimeLoading: false,
+                        usage: "encipherment",
+                        buildChain: false,
                         certificateFile: $cert_file,
                         keyFile: $key_file
-                    }]
+                    }],
+                    settings: {
+                        fingerprint: "chrome",
+                        echConfigList: "",
+                        pinnedPeerCertSha256: [],
+                        verifyPeerCertByName: ""
+                    }
                 }
             },
             sniffing: {
                 enabled: true,
                 destOverride: ["http", "tls", "quic"],
                 metadataOnly: false,
-                routeOnly: false
+                routeOnly: true
             }
         }')"
 
@@ -603,20 +696,31 @@ configure_xui_api() {
 
     client_payload="$(jq -n \
         --arg email "${client_name}" \
+        --arg client_id "${client_uuid}" \
+        --arg password "${client_password}" \
+        --arg sub_id "${client_sub_id}" \
+        --arg auth "${client_auth}" \
         --argjson total_gb "${total_bytes}" \
         --argjson expiry_time "${expiry_time}" \
         --argjson reset_day "${current_day}" \
         ' {
             email: $email,
+            id: $client_id,
+            password: $password,
+            subId: $sub_id,
+            auth: $auth,
             totalGB: $total_gb,
             expiryTime: $expiry_time,
             enable: true,
             limitIp: 0,
             limitHwid: 0,
             tgId: 0,
-            reset: 0,
-            resetDay: $reset_day,
+            reset: 30,
+            resetDay: 0,
             resetMax: 0,
+            trafficReset: "monthly",
+            trafficResetDay: $reset_day,
+            security: "auto",
             flow: "xtls-rprx-vision"
         }')"
 
