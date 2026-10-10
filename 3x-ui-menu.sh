@@ -285,6 +285,29 @@ enable_bbr() {
     printf '26\n1\n\n0\n0\n' | x-ui
 }
 
+set_shanghai_timezone() {
+    local current_timezone
+
+    if ! command -v timedatectl >/dev/null 2>&1; then
+        echo "错误：未找到 timedatectl，无法设置系统时区。"
+        return 1
+    fi
+
+    if ! timedatectl set-timezone Asia/Shanghai; then
+        echo "错误：设置系统时区失败。"
+        return 1
+    fi
+
+    current_timezone="$(timedatectl show -p Timezone --value)" || return 1
+    if [[ "${current_timezone}" != "Asia/Shanghai" ]]; then
+        echo "错误：系统时区验证失败，当前时区为 ${current_timezone}。"
+        return 1
+    fi
+
+    echo "系统时区已设置为 Asia/Shanghai。"
+    date '+当前时间：%Y-%m-%d %H:%M:%S %Z'
+}
+
 request_domain_certificate() {
     if ! command -v x-ui >/dev/null 2>&1; then
         echo "错误：未找到 x-ui 命令，请先选择菜单中的 1 安装 3x-ui。"
@@ -785,6 +808,7 @@ show_menu() {
     echo "4. 安装 Komari 监控"
     echo "5. 配置 Nginx"
     echo "6. 通过 API 配置 3x-ui 入站、客户端和面板设置"
+    echo "7. 设置系统时区为 Asia/Shanghai"
     echo "0. 退出"
     echo "========================================"
 }
@@ -815,12 +839,15 @@ main() {
             6)
                 configure_xui_api
                 ;;
+            7)
+                set_shanghai_timezone
+                ;;
             0)
                 echo "已退出。"
                 exit 0
                 ;;
             *)
-                echo "无效选项，请输入 1、2、3、4、5、6 或 0。"
+                echo "无效选项，请输入 1、2、3、4、5、6、7 或 0。"
                 ;;
         esac
 
