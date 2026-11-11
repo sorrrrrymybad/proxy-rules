@@ -381,8 +381,10 @@ configure_nginx() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
     cat > "${nginx_site}" <<EOF
 server {
-    listen 8443 ssl;
+    listen 8443 ssl http2;
     server_name ${domain} www.${domain};
+
+    ssl_protocols TLSv1.2 TLSv1.3;
 
     ssl_certificate ${cert_dir}/fullchain.pem;
     ssl_certificate_key ${cert_dir}/privkey.pem;
