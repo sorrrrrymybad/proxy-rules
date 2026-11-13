@@ -1,7 +1,7 @@
 payload:
   - '+.pt.btschool.club'
   - '+.gamegamept.com'
-  - '+.hddolby.com'
+  - '+.uhddolby.com'
   - '+.hdtime.org'
   - '+.hhanclub.net'
   - '+.m-team.cc'
