@@ -354,13 +354,94 @@ install_komari() {
     curl -fsSL "https://raw.githubusercontent.com/luodaoyi/komari-zig-agent/refs/heads/main/replace.sh" | sh
 }
 
+install_nginx_release() {
+    local version="1.30.7" package_version signing_key fingerprints
+    local keyring="/usr/share/keyrings/nginx-archive-keyring.asc"
+    local ID VERSION_CODENAME
+
+    source /etc/os-release
+    if [[ ! "${ID:-}" =~ ^(debian|ubuntu)$ || ! "${VERSION_CODENAME:-}" =~ ^[a-z]+$ ]]; then
+        echo "错误：无法识别受支持的 Debian/Ubuntu 版本。" >&2
+        return 1
+    fi
+
+    apt-get update
+    apt-get install -y ca-certificates curl gnupg
+    signing_key="$(curl -fsSL https://nginx.org/keys/nginx_signing.key)"
+    fingerprints="$(gpg --batch --show-keys --with-colons <<<"${signing_key}")"
+    if ! grep -q '^fpr:::::::::573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62:$' <<<"${fingerprints}"; then
+        echo "错误：Nginx 软件源签名密钥指纹不匹配。" >&2
+        return 1
+    fi
+    printf '%s\n' "${signing_key}" > "${keyring}"
+    chmod 0644 "${keyring}"
+    printf 'deb [signed-by=%s] https://nginx.org/packages/%s %s nginx\n' \
+        "${keyring}" "${ID}" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/nginx.list
+    apt-get update
+
+    package_version="$(apt-cache madison nginx | awk -v version="${version}" '
+        $5 ~ /^https:\/\/nginx\.org\/packages\/(debian|ubuntu)\/?$/ &&
+        ($3 == version || index($3, version "-") == 1 || index($3, version "~") == 1) {
+            if (!found++) print $3
+        }')"
+    if [[ -z "${package_version}" ]]; then
+        echo "错误：当前系统的软件源没有 Nginx ${version} 安装包。" >&2
+        return 1
+    fi
+    apt-get install -y -o Dpkg::Options::=--force-confold "nginx=${package_version}"
+    [[ "$(nginx -v 2>&1)" == "nginx version: nginx/${version}" ]]
+}
+
+ensure_nginx_sites_include() (
+    local conf="/etc/nginx/nginx.conf" loaded site="$1" candidate
+    local directive='include /etc/nginx/sites-enabled/*;'
+
+    # shortcut: edits a standalone top-level http opening line, review unusual layouts manually.
+    candidate="$(mktemp /etc/nginx/.nginx.conf.XXXXXX)" || return 1
+    trap 'rm -f -- "${candidate}"' EXIT
+    if ! awk -v directive="${directive}" '
+        {
+            lines[NR] = $0
+            line = $0
+            sub(/#.*/, "", line)
+            if (depth == 0 && line ~ /^[[:space:]]*http[[:space:]]*\{[[:space:]]*$/) http = NR
+            if (http && !http_closed && depth == 1 && line ~ /^[[:space:]]*include[[:space:]]+\/etc\/nginx\/sites-enabled\/\*[[:space:]]*;[[:space:]]*$/) included = 1
+            opens = gsub(/\{/, "", line)
+            closes = gsub(/\}/, "", line)
+            depth += opens - closes
+            if (http && depth == 0) http_closed = 1
+        }
+        END {
+            if (!http_closed) exit 1
+            for (i = 1; i <= NR; i++) {
+                print lines[i]
+                if (i == http && !included) print "    " directive
+            }
+        }
+    ' "${conf}" > "${candidate}"; then
+        echo "错误：无法定位 ${conf} 中的独立 http {，请检查主配置。" >&2
+        return 1
+    fi
+    loaded="$(nginx -T -c "${candidate}")" || return 1
+    if ! grep -Fxq "# configuration file ${site}:" <<<"${loaded}"; then
+        echo "错误：Nginx 未加载站点 ${site}。" >&2
+        return 1
+    fi
+    if ! cmp -s "${candidate}" "${conf}"; then
+        cp -- "${candidate}" "${conf}" || return 1
+        echo "已在主配置的 http 块添加站点引用。"
+    else
+        echo "主配置的 http 块已包含站点引用。"
+    fi
+)
+
 configure_nginx() {
     if ! command -v apt-get >/dev/null 2>&1; then
         echo "错误：未找到 apt-get，此选项适用于 Debian/Ubuntu 系统。"
         return 1
     fi
 
-    local domain nginx_site cert_dir
+    local domain nginx_site cert_dir previous_version
     read -r -p "请输入域名: " domain
     domain="${domain// /}"
 
@@ -374,14 +455,15 @@ configure_nginx() {
     nginx_site="/etc/nginx/sites-available/${domain}"
     cert_dir="/root/cert/${domain}"
 
-    echo "正在安装 Nginx..."
-    apt-get update
-    apt-get install -y nginx
+    previous_version="$(nginx -v 2>&1 || true)"
+    echo "正在安装 Nginx 1.30.7..."
+    install_nginx_release
 
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
     cat > "${nginx_site}" <<EOF
 server {
-    listen 8443 ssl http2;
+    listen 8443 ssl;
+    http2 on;
     server_name ${domain} www.${domain};
 
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -401,8 +483,13 @@ EOF
     ln -sfn "${nginx_site}" "/etc/nginx/sites-enabled/${domain}"
     rm -f /etc/nginx/sites-enabled/default
 
+    ensure_nginx_sites_include "/etc/nginx/sites-enabled/${domain}"
     nginx -t
-    systemctl reload nginx
+    if [[ "${previous_version}" != "$(nginx -v 2>&1)" ]]; then
+        systemctl restart nginx
+    else
+        systemctl reload nginx
+    fi
     echo "Nginx 配置完成：${nginx_site}"
 }
 
