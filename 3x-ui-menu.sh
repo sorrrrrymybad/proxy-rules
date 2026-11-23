@@ -886,6 +886,50 @@ configure_xui_api() {
     echo "订阅备注模板：${SUBSCRIPTION_REMARK_TEMPLATE}"
 }
 
+install_nodejs_pm2() (
+    local arch version archive release_url work_dir checksum
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64) arch=x64 ;;
+        Linux:aarch64) arch=arm64 ;;
+        *) echo "错误：此选项支持 Linux x86_64 和 arm64。" >&2; return 1 ;;
+    esac
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "错误：此选项需要 Debian/Ubuntu 的 apt-get。" >&2
+        return 1
+    fi
+
+    apt-get update || return 1
+    apt-get install -y ca-certificates curl jq xz-utils libatomic1 || return 1
+    version="$(curl -fsSL https://nodejs.org/dist/index.json | jq -er 'first(.[] | select(.lts != false) | .version)')" || return 1
+    if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "错误：未找到有效的 Node.js LTS 版本。" >&2
+        return 1
+    fi
+
+    archive="node-${version}-linux-${arch}.tar.xz"
+    release_url="https://nodejs.org/dist/${version}"
+    work_dir="$(mktemp -d /tmp/nodejs-install.XXXXXX)" || return 1
+    trap 'rm -rf -- "${work_dir}"' EXIT
+    cd "${work_dir}" || return 1
+
+    echo "正在安装 Node.js ${version} LTS 和 PM2..."
+    curl -fsSL "${release_url}/${archive}" -o "${archive}" || return 1
+    curl -fsSL "${release_url}/SHASUMS256.txt" -o SHASUMS256.txt || return 1
+    checksum="$(awk -v archive="${archive}" '$2 == archive { print $1 }' SHASUMS256.txt)"
+    [[ "${checksum}" =~ ^[0-9a-f]{64}$ ]] || { echo "错误：缺少有效的 Node.js 校验和。" >&2; return 1; }
+    printf '%s  %s\n' "${checksum}" "${archive}" | sha256sum --check || return 1
+
+    tar --no-same-owner -xJf "${archive}" --strip-components=1 || return 1
+    if [[ "$(./bin/node --version)" != "${version}" ]]; then
+        echo "错误：当前系统无法运行下载的 Node.js ${version}。" >&2
+        return 1
+    fi
+    cp -a bin include lib share /usr/local/ || return 1
+    export PATH="/usr/local/bin:${PATH}"
+    npm install --global --prefix /usr/local pm2@latest || return 1
+    node --version && npm --version && npm list --global --prefix /usr/local --depth=0 pm2
+)
+
 show_menu() {
     echo
     echo "========================================"
@@ -898,6 +942,7 @@ show_menu() {
     echo "5. 配置 Nginx"
     echo "6. 通过 API 配置 3x-ui 入站、客户端和面板设置"
     echo "7. 设置系统时区为 Asia/Shanghai"
+    echo "8. 安装 Node.js 最新 LTS 和 PM2"
     echo "0. 退出"
     echo "========================================"
 }
@@ -931,12 +976,15 @@ main() {
             7)
                 set_shanghai_timezone
                 ;;
+            8)
+                install_nodejs_pm2 || echo "错误：Node.js 或 PM2 安装失败。" >&2
+                ;;
             0)
                 echo "已退出。"
                 exit 0
                 ;;
             *)
-                echo "无效选项，请输入 1、2、3、4、5、6、7 或 0。"
+                echo "无效选项，请输入 1、2、3、4、5、6、7、8 或 0。"
                 ;;
         esac
 
